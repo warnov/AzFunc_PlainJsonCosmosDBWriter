@@ -1,0 +1,2 @@
+# AzFunc_PlainJsonCosmosDBWriter
+This is an Azure Function able to receive a plain JSON array in the raw body of the POST method and insert it on a specified collection of an Azure Cosmos DB. It is very useful to replace functionality offered by services such as Keen.io without the expensive costs it has. For example it could act as a webhook for SendGrid to send you the status of the email messages you have sent. Then you could review those statuses querying your Cosmos DB.
