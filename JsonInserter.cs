@@ -22,37 +22,13 @@ namespace CosmosDBJSonInserter
     public static class JsonInserter
     {
 
-        #region Static Members
-        //This function can manage both: connections to SQL Core model for CosmosDB
-        //or MongoDB (in CosmosDB or other providers)        
-
-        //Variables for SQL Core Model
-        private static string _cosmosDbEndpointUri = string.Empty;
-        private static string _cosmosDbPrimaryKey = string.Empty;
-        //The data sent from the client to Azure Functions is supossed to come
-        //in raw json format inside the body of the post message; 
-        //specifically, as an array of json documents.
-        //That's why we are using the JArray object.
-        private static JArray _cosmosDbData = null;
-
-        //Variables for MongoDB:
-        private static string _mongoDbConnectionString = string.Empty;
-        //For MongoDB instead of a JArray we use a BsonDocument Array
-        private static BsonDocument[] _mongoDbData = null;
-
-        //Common variables for both models
+        #region Static Members      
         private static string _dbName = string.Empty;
-        private static string _dbCollectionName = string.Empty;
-        private static ILogger _log;
-        private static uint _successfullInsertions = 0;
-        private static string _dbModelName = string.Empty;
-        private static int _docCount = 0;
-        private static string _requestData = string.Empty;
-        private static IConfigurationRoot _config = null;
-        private static bool _isBadRequest = false;
+        private static string _dbCollectionName = string.Empty;   
         private static bool _useMongoDb = false;
-
-
+        private static string _dbModelName = string.Empty;
+        private static ILogger _log;
+        private static IConfigurationRoot _config = null;
         #endregion
 
         [FunctionName("JsonInserter")]
@@ -74,6 +50,8 @@ namespace CosmosDBJSonInserter
                 .AddEnvironmentVariables()
                 .Build();
 
+            CosmosDBJSonInserterResult result;
+
 
             //Checking the working model for the function (from app settings)
             //And then inserting
@@ -83,29 +61,23 @@ namespace CosmosDBJSonInserter
                 _dbName = _config["dbName"];
                 _dbCollectionName = _config["dbCollectionName"];
                 //Extracting data from POST
-                _requestData = new StreamReader(req.Body).ReadToEnd();
+                var requestData = new StreamReader(req.Body).ReadToEnd();
 
                 try
                 {
-                    if (_useMongoDb)
-                    {
-                        await MongoInsert();
-                    }
-                    else
-                    {
-                        await SqlInsert();
-                    }
-
+                    result = _useMongoDb ?
+                        await MongoInsert(requestData) :
+                        await SqlInsert(requestData);
                 }
-                catch (Exception exc)
+                catch (CosmosDBJSonInserterException exc)
                 {
                     log.LogError(exc.Message);
-                    if (_isBadRequest)
-                        return new ExceptionResult(exc, true);
-                    else return new BadRequestObjectResult(exc.Message);
+                    if (exc.IsBadRequest)
+                        return new BadRequestObjectResult(exc.Message);
+                    else return new ExceptionResult(exc, true);
                 }
                 //Report the results of the operation
-                string endingMessage = ReportResults();
+                string endingMessage = ReportResults(result);
 
                 //Sending the response
                 return new OkObjectResult(endingMessage);
@@ -122,35 +94,40 @@ namespace CosmosDBJSonInserter
         /// <summary>
         /// Insertion of data in a CosmosDB with SQL Model
         /// </summary>
-        private static async Task SqlInsert()
+        private static async Task<CosmosDBJSonInserterResult> SqlInsert(string requestData)
         {
+            //The data sent from the client to Azure Functions is supossed to come
+            //in raw json format inside the body of the post message; 
+            //specifically, as an array of json documents.
+            //That's why we are using the JArray object.         
+            JArray cosmosDbData = null;
+            int insertions = 0;
             try
             {
-                _cosmosDbData = (JArray)JsonConvert.DeserializeObject(_requestData);
+                cosmosDbData = (JArray)JsonConvert.DeserializeObject(requestData);
             }
             catch (Exception exc)
             {
-                _isBadRequest = true;
                 //As we relay on the json info correctly beign parsed, 
                 //if we have an exception trying to parse it, then we must finish the execution
                 //Exceptions in this functions are handled writing a message in the log
                 //so we could trace in which part of the fucntion it was originated
                 //And returning the most suitable error message with the exception text
                 //as the function response
-                throw new Exception(ParamError(exc), exc);
+                throw new CosmosDBJSonInserterException(ParamError(exc), exc, true);
             }
             //Setting up the connection string for SQL Core model
             _dbModelName = "CosmosDB";
-            _cosmosDbEndpointUri = _config["cosmosDbEndpointUri"];
-            _cosmosDbPrimaryKey = _config["cosmosDbPrimaryKey"];
-            _docCount = _cosmosDbData.Count;
+            var cosmosDbEndpointUri = _config["cosmosDbEndpointUri"];
+            var cosmosDbPrimaryKey = _config["cosmosDbPrimaryKey"];
+
             //This is going to be the object that allows us to communicate with cosmosDB
             //It comes in the Microsoft.Azure.DocumentDB.Core package, so be sure to include it
             DocumentClient client;
             try
             {
                 //Client must be initialized with the cosmosdb uri and key
-                client = new DocumentClient(new Uri(_cosmosDbEndpointUri), _cosmosDbPrimaryKey);
+                client = new DocumentClient(new Uri(cosmosDbEndpointUri), cosmosDbPrimaryKey);
                 //If the desired database doesn't exist it is created
                 await client.CreateDatabaseIfNotExistsAsync(new Database { Id = _dbName });
                 //If the desired collection doesn't exist it is created
@@ -164,47 +141,54 @@ namespace CosmosDBJSonInserter
             }
 
             //Now that we have the db context we can proceed to insert the json documents in data           
-            foreach (var jobj in _cosmosDbData)
+            foreach (var jobj in cosmosDbData)
             {
                 try
                 {
                     await client.CreateDocumentAsync(
                         UriFactory.CreateDocumentCollectionUri(_dbName, _dbCollectionName),
                         jobj);
-                    _successfullInsertions++;
+                    insertions++;
                 }
                 catch (Exception exc)
                 {
                     LogInsertionError(jobj, exc);
                 }
             }
+            return new CosmosDBJSonInserterResult()
+            {
+                Total = cosmosDbData.Count,
+                Inserted = insertions
+            };
         }
 
         /// <summary>
         /// Insertion of data in a MongoDB (even in CosmosDB with the MongoDB model)
         /// </summary>
-        private static async Task MongoInsert()
+        private static async Task<CosmosDBJSonInserterResult> MongoInsert(string requestData)
         {
+
+            //For MongoDB instead of a JArray we use a BsonDocument Array
+            BsonDocument[] mongoDbData;
             try
             {
-                _mongoDbData = BsonSerializer.Deserialize<BsonDocument[]>(_requestData);
+                mongoDbData = BsonSerializer.Deserialize<BsonDocument[]>(requestData);
             }
             catch (Exception exc)
             {
-                _isBadRequest = true;
                 //As we relay on the json info correctly beign parsed, 
                 //if we have an exception trying to parse it, then we must finish the execution
                 //Exceptions in this functions are handled writing a message in the log
                 //so we could trace in which part of the fucntion it was originated
                 //And returning the most suitable error message with the exception text
                 //as the function response
-                throw new Exception(ParamError(exc), exc);
+                throw new CosmosDBJSonInserterException(ParamError(exc), exc, true);
             }
 
-            _docCount = _mongoDbData.Length;
+
             //Setting up the connection string for mongoDb model
             _dbModelName = "MongoDB";
-            _mongoDbConnectionString = _config["mongoDbConnectionString"];
+            var mongoDbConnectionString = _config["mongoDbConnectionString"];
 
 
             //This is going to be the object that allows us to communicate with MongoDB
@@ -213,7 +197,7 @@ namespace CosmosDBJSonInserter
             try
             {
                 //Client must be initialized with the mongodb connection string
-                var client = new MongoClient(_mongoDbConnectionString);
+                var client = new MongoClient(mongoDbConnectionString);
                 //If the desired database doesn't exist it is created with the GetDatabase command
                 var db = client.GetDatabase(_dbName);
                 //If the desired collection doesn't exist it is created with GetCollection command
@@ -227,12 +211,18 @@ namespace CosmosDBJSonInserter
 
             try
             {
-                await collection.InsertManyAsync(_mongoDbData);
+                await collection.InsertManyAsync(mongoDbData);
             }
             catch (Exception exc)
             {
                 throw new Exception($"({DbCommError(exc)} - Inserting", exc);
             }
+
+            return new CosmosDBJSonInserterResult()
+            {
+                Inserted = mongoDbData.Length,
+                Total = mongoDbData.Length
+            };
         }
 
         /// <summary>
@@ -277,15 +267,37 @@ namespace CosmosDBJSonInserter
         /// of documents passed to the function to be processed
         /// </summary>
         /// <returns>The report string</returns>
-        private static string ReportResults()
+        private static string ReportResults(CosmosDBJSonInserterResult result)
         {
             var endingMessage = _useMongoDb ?
-                $"{_docCount} documents inserted successfully" :
-                $"{_successfullInsertions} / {_docCount} documents inserted";
+                $"{result.Total} documents inserted successfully" :
+                $"{result.Inserted} / {result.Total} documents inserted";
             endingMessage = $"{endingMessage} in {_dbModelName}: {_dbName}/{_dbCollectionName}";
             _log.LogInformation(endingMessage);
             return endingMessage;
         }
 
+    }
+
+    /// <summary>
+    /// Exception handler for the function
+    /// Has an specialization for knowing when an exception is caused by a bad request
+    /// </summary>
+    public class CosmosDBJSonInserterException : Exception
+    {
+        public CosmosDBJSonInserterException(string message, Exception innerException, bool isBadRequest) : base(message, innerException)
+        {
+            IsBadRequest = isBadRequest;
+        }
+        public bool IsBadRequest { get; set; }
+    }
+
+    /// <summary>
+    /// This struct help us to measure the results of the function process
+    /// </summary>
+    public struct CosmosDBJSonInserterResult
+    {
+        public int Inserted { get; set; }
+        public int Total { get; set; }
     }
 }
